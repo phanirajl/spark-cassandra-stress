@@ -6,6 +6,7 @@ import org.apache.spark.SparkConf
 import org.reflections.Reflections
 import org.apache.spark.sql.{SparkSession, SaveMode}
 import collection.JavaConversions._
+import scala.math._
 
 object DistributedDataType extends Enumeration {
   val RDD  = Value("rdd")
@@ -19,6 +20,14 @@ object SaveMethod extends Enumeration {
   val Json = Value("json")
   val Csv = Value("csv")
   val Text = Value("text")
+}
+
+object ValidNumericAnnotations extends Enumeration {
+  val k = Value("k")
+  val m = Value("m")
+  val b = Value("b")
+  val t = Value("t")
+  val q = Value("q")
 }
 
 case class TableLocation(keyspace: String, table: String)
@@ -49,7 +58,8 @@ case class Config(
   numReceivers: Int = 1,
   receiverThroughputPerBatch: Long = 100000,
   terminationTimeMinutes: Long = 0,
-  streamingBatchIntervalSeconds:  Int = 5
+  streamingBatchIntervalSeconds:  Int = 5,
+  inClauseKeys: Int = 2000
 )
 
 case class TestResult ( time: Long, ops: Long )
@@ -59,6 +69,7 @@ object SparkCassandraStress {
   val VALID_TESTS = getValidTestNames()
 
   val KeyGroupings = Seq("none", "replica_set", "partition")
+  val supportedAnnotationsMsg = s"Ex. 1000, 1k (thousand), 2m (million), 3B (billion), 4q (quadrillion)"
 
   def main(args: Array[String]) {
 
@@ -126,13 +137,13 @@ object SparkCassandraStress {
         config.copy(trials = arg)
       } text {"Trials to run"}
 
-      opt[Long]('o',"totalOps") optional() action { (arg,config) =>
-        config.copy(totalOps = arg)
-      } text {"Total number of operations to execute"}
+      opt[String]('o',"totalOps") optional() action { (arg,config) =>
+        config.copy(totalOps = unpackAnnotatedNumeric(arg))
+      } text {s"Total number of operations to execute. ${supportedAnnotationsMsg}"}
 
       opt[Int]('p',"numPartitions") optional() action { (arg,config) =>
         config.copy(numPartitions = arg)
-      } text {"Number of Spark Partitions To Create"}
+      } text {s"Number of Spark Partitions To Create."}
 
       opt[Long]('c',"seed") optional() action { (arg,config) =>
         config.copy(seed = arg)
@@ -150,9 +161,9 @@ object SparkCassandraStress {
         config.copy(verboseOutput = true)
       } text {"Display verbose output for debugging."}
 
-      opt[Long]('y',"numTotalKeys") optional() action { (arg,config) =>
-        config.copy(numTotalKeys = arg)
-      } text {"Total Number of CQL Partition Key Values"}
+      opt[String]('y',"numTotalKeys") optional() action { (arg,config) =>
+        config.copy(numTotalKeys = unpackAnnotatedNumeric(arg))
+      } text {s"Total Number of CQL Partition Key Values. ${supportedAnnotationsMsg}"}
 
       opt[Int]('w',"numReceivers") optional() action { (arg,config) =>
         config.copy(numReceivers = arg)
@@ -169,6 +180,11 @@ object SparkCassandraStress {
       opt[Int]('m',"terminationTimeMinutes") optional() action { (arg,config) =>
         config.copy(terminationTimeMinutes = arg)
       } text { "The desired runtime (in minutes) for a given workload. WARNING: Not supported with multiple trials or read workloads."}
+
+      opt[Int]("inClauseKeys") optional() action { (arg,config) =>
+        config.copy(inClauseKeys = arg)
+      } text {s"Number of keys in 'IN' clause, applicable only for tests that execute select queries " +
+        s"with 'IN' clause."}
 
       arg[String]("connectorOpts") optional() text { """spark-cassandra-connector configs, Ex: --conf "conf1=val1" --conf "conf2=val2" """}
 
@@ -190,6 +206,31 @@ object SparkCassandraStress {
       }
     } getOrElse {
       System.exit(1)
+    }
+  }
+
+  def unpackAnnotatedNumeric(num: String): Long = {
+
+    if (num forall Character.isDigit) {
+      num.toLong
+    } else {
+      val numericPortion = num.init
+      assert(numericPortion forall Character.isDigit)
+
+      val numericAnnotation = num.toLowerCase.last
+      assert(Character.isLetter(numericAnnotation))
+
+      try {
+        ValidNumericAnnotations.withName(numericAnnotation.toString) match {
+          case ValidNumericAnnotations.k => numericPortion.toLong * pow(10, 3).toLong // thousand
+          case ValidNumericAnnotations.m => numericPortion.toLong * pow(10, 6).toLong // million
+          case ValidNumericAnnotations.b => numericPortion.toLong * pow(10, 9).toLong // billion
+          case ValidNumericAnnotations.t => numericPortion.toLong * pow(10, 12).toLong // trillion
+          case ValidNumericAnnotations.q => numericPortion.toLong * pow(10, 15).toLong // quadrillion
+        }
+      } catch {
+        case ex: NoSuchElementException => throw new UnsupportedOperationException(s"${ex}: ${supportedAnnotationsMsg}")
+      }
     }
   }
 
@@ -263,26 +304,25 @@ object SparkCassandraStress {
     }
 
     val test: StressTask = getStressTest(config, ss)
-    val wallClockStartTime = System.nanoTime()
     val timesAndOps: Seq[TestResult]= test.runTrials(ss)
     val time = for (x <- timesAndOps) yield {x.time}
     val totalCompletedOps = for (x <- timesAndOps) yield {x.ops}
 
-    val wallClockStopTime = System.nanoTime() 
-    val wallClockTimeDiff = wallClockStopTime - wallClockStartTime
-    val wallClockTimeSeconds = (wallClockTimeDiff / 1000000000.0) 
     val timeSeconds = time.map{ x => round( x / 1000000000.0 ) }
-    val opsPerSecond = for (i <- 0 to timeSeconds.size-1) yield {round((totalCompletedOps(i)).toDouble/timeSeconds(i))}
+    val timeMillis = time.map{ x => round( x / 1000000.0 ) }
+    val opsPerSecond = for (i <- timeSeconds.indices) yield {round(totalCompletedOps(i).toDouble/timeSeconds(i))}
 
     test match {
-      case x: WriteTask[_] =>  {
+      case _: WriteTask[_] =>  {
         println(s"TimeInSeconds : ${timeSeconds.mkString(",")}\n")
         println(s"OpsPerSecond : ${opsPerSecond.mkString(",")}\n")
         config.file.map(f => {f.write(csvResults(config, time));f.flush })
         ss.stop()
       }
-      case x: ReadTask => {
+      case _: ReadTask => {
         println(s"TimeInSeconds : ${timeSeconds.mkString(",")}\n")
+        println(s"TimeInMillis : ${timeMillis.mkString(",")}\n")
+        println(s"Average [ms]: ${timeMillis.sum.toDouble / timeSeconds.size}\n")
         config.file.map(f => {f.write(csvResults(config, time));f.flush })
         ss.stop()
       }
